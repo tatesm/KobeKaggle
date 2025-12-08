@@ -1,0 +1,329 @@
+#############################
+## Libraries
+#############################
+
+library(tidyverse)
+library(vroom)
+library(lubridate)
+library(bonsai)
+
+library(tidymodels)
+tidymodels_prefer()
+
+set.seed(123)
+
+#############################
+## Read data
+#############################
+
+# Change the path/filename if needed
+kobe_raw <- vroom("kobe.csv")  # or Kaggle path
+glimpse(kobe_raw)
+
+#############################
+## Train / test split
+#############################
+
+# shot_made_flag is NA for rows you must predict (test)
+kobe <- kobe_raw %>%
+  mutate(
+    shot_made_flag = as.factor(shot_made_flag)  # "0"/"1" as factor
+  )
+
+kobe_train <- kobe %>%
+  filter(!is.na(shot_made_flag))
+
+kobe_test <- kobe %>%
+  filter(is.na(shot_made_flag))
+
+#############################
+## Feature Engineering (combined best)
+#############################
+
+fe_engineer <- function(df) {
+  df %>%
+    mutate(
+      # ---- Geometry -----------------------------------------------------
+      distance_hyp = sqrt(loc_x^2 + loc_y^2),
+      
+      # horizontal angle in degrees (x vs y-plane)
+      angle_deg = atan2(loc_x, pmax(loc_y, 1e-3)) * 180 / pi,
+      
+      # smoother encodings of angle
+      angle_sin = sin(angle_deg * pi / 180),
+      angle_cos = cos(angle_deg * pi / 180),
+      
+      angle_abs   = abs(angle_deg),
+      distance_sq = distance_hyp^2,
+      
+      # positional bins
+      side = case_when(
+        loc_x <= -80 ~ "left",
+        loc_x >=  80 ~ "right",
+        TRUE         ~ "center"
+      ),
+      
+      distance_bin = cut(
+        distance_hyp,
+        breaks = c(-Inf, 5, 12, 22, 30, Inf),
+        labels = c("0-5", "5-12", "12-22", "22-30", "30+")
+      ),
+      
+      angle_bin = cut(
+        angle_deg,
+        breaks = c(-180, -67.5, -22.5, 22.5, 67.5, 180),
+        labels = c("left_corner", "left_wing", "center", "right_wing", "right_corner")
+      ),
+      
+      loc_x_bin = cut(
+        loc_x,
+        breaks = c(-250, -150, -50, 50, 150, 250),
+        labels = c("far_left","left","center","right","far_right")
+      ),
+      
+      loc_y_bin = cut(
+        loc_y,
+        breaks = c(-50, 0, 80, 160, 250, 300),
+        labels = c("behind","paint","mid_paint","mid_range","long_mid")
+      ),
+      
+      # ---- Time & game context ------------------------------------------
+      home = if_else(str_detect(matchup, "vs\\."), 1L, 0L),
+      
+      time_remaining = minutes_remaining * 60 + seconds_remaining,
+      
+      # shot-clock pressure
+      time_pressure = 1 / pmax(time_remaining, 1),
+      
+      total_game_seconds = (pmax(period - 1, 0) * 12 * 60) +
+        (12 * 60 - time_remaining),
+      
+      clutch_period_last_min = if_else(time_remaining <= 60, 1L, 0L),
+      clutch_game_last2      = if_else(period >= 4 & time_remaining <= 120, 1L, 0L),
+      
+      # rough “pressure” proxy
+      pressure_proxy = case_when(
+        loc_y < 30  ~ "heavy",
+        loc_y < 100 ~ "medium",
+        TRUE        ~ "light"
+      ),
+      
+      # ---- Season & shot type -------------------------------------------
+      game_year  = year(game_date),
+      game_month = month(game_date),
+      game_dow   = wday(game_date, label = TRUE),
+      
+      
+      season_start = as.integer(str_sub(season, 1, 4)),
+      season_index = season_start - min(season_start, na.rm = TRUE),
+      
+      is_three = if_else(shot_type == "3PT Field Goal", 1L, 0L),
+      
+      # factors
+      playoffs       = as.factor(playoffs),
+      side           = factor(side),
+      distance_bin   = factor(distance_bin),
+      angle_bin      = factor(angle_bin),
+      loc_x_bin      = factor(loc_x_bin),
+      loc_y_bin      = factor(loc_y_bin),
+      pressure_proxy = factor(pressure_proxy),
+      
+      # ---- Interaction-style features XGB likes -------------------------
+      dist_angle   = distance_hyp * angle_abs,        # distance * |angle|
+      three_angle  = is_three     * angle_abs,        # 3pt * |angle|
+      clutch_three = clutch_game_last2 * is_three     # late-game 3s
+    )
+}
+
+
+#############################
+## Build engineered train/test
+#############################
+
+kobe_train_fe <- fe_engineer(kobe_train)
+kobe_test_fe  <- fe_engineer(kobe_test)
+
+# Add seconds_since_last per game
+kobe_train_fe <- kobe_train_fe %>%
+  arrange(game_id, total_game_seconds) %>%
+  group_by(game_id) %>%
+  mutate(
+    seconds_since_last = total_game_seconds - dplyr::lag(total_game_seconds, default = first(total_game_seconds))
+  ) %>%
+  ungroup()
+
+
+kobe_test_fe <- kobe_test_fe %>%
+  arrange(game_id, total_game_seconds) %>%
+  group_by(game_id) %>%
+  mutate(
+    seconds_since_last = total_game_seconds - dplyr::lag(total_game_seconds, default = first(total_game_seconds))
+  ) %>%
+  ungroup()
+
+
+glimpse(kobe_train_fe[, c(
+  "distance_hyp","angle_abs","distance_sq",
+  "angle_sin","angle_cos",
+  "dist_angle","three_angle","clutch_three",
+  "clutch_game_last2","is_three",
+  "seconds_since_last"
+)])
+
+
+#############################
+## Recipe (tree/XGB friendly)
+#############################
+
+shot_rec <- recipe(shot_made_flag ~ ., data = kobe_train_fe) %>%
+  update_role(shot_id, new_role = "id") %>%
+  # Drop clear IDs / near-IDs
+  step_rm(game_event_id, game_id, team_id, team_name, game_date) %>%
+  # Handle novel & unknown factor levels
+  step_novel(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  # Optionally collapse rare levels
+  step_other(all_nominal_predictors(), threshold = 0.01) %>%
+  # One-hot encode
+  step_dummy(all_nominal_predictors()) %>%
+  # Drop zero-variance columns
+  step_zv(all_predictors())
+# NOTE: no step_normalize() – not needed for trees/XGB
+
+#############################
+## Stratified Resampling
+#############################
+
+set.seed(123)
+folds <- vfold_cv(
+  kobe_train_fe,
+  v      = 5,
+  strata = shot_made_flag
+)
+
+#############################
+## Metrics
+#############################
+
+metric_funs <- metric_set(mn_log_loss, roc_auc, accuracy)
+
+#############################
+## XGBoost specification + workflow
+#############################
+
+xgb_spec <- boost_tree(
+  trees          = tune(),  # total trees
+  tree_depth     = tune(),  # max_depth
+  min_n          = tune(),  # min_child_weight-ish
+  loss_reduction = tune(),  # gamma
+  sample_size    = tune(),  # subsample
+  mtry           = tune(),  # colsample_bytree
+  learn_rate     = tune()
+) %>%
+  set_mode("classification") %>%
+  set_engine("xgboost", eval_metric = "logloss")
+
+xgb_wf <- workflow() %>%
+  add_model(xgb_spec) %>%
+  add_recipe(shot_rec)
+
+#############################
+## XGBoost hyperparameter grid
+#############################
+
+xgb_params <- parameters(
+  mtry(),
+  trees(),
+  tree_depth(),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  learn_rate()
+) %>%
+  update(
+    mtry        = mtry(c(10L, 60L)),
+    trees       = trees(c(800L, 2200L)),
+    tree_depth  = tree_depth(c(3L, 10L)),
+    min_n       = min_n(c(1L, 20L)),
+    sample_size = sample_prop(c(0.6, 1.0)),
+    # log10-scale learn rate ≈ 0.001–0.03
+    learn_rate  = learn_rate(c(-3, -1.5))
+  )
+
+set.seed(123)
+xgb_grid <- grid_latin_hypercube(
+  xgb_params,
+  size = 40
+)
+
+#############################
+## XGBoost tuning
+#############################
+
+set.seed(123)
+xgb_res <- tune_grid(
+  xgb_wf,
+  resamples = folds,
+  grid      = xgb_grid,
+  metrics   = metric_funs,
+  control   = control_grid(save_pred = TRUE)
+)
+
+collect_metrics(xgb_res) %>%
+  filter(.metric == "mn_log_loss") %>%
+  arrange(mean) %>%
+  head(10)
+
+#############################
+## Select best XGBoost model
+#############################
+
+best_xgb <- select_best(xgb_res, metric = "mn_log_loss")
+best_xgb
+
+final_xgb_wf <- finalize_workflow(xgb_wf, best_xgb)
+
+#############################
+## Fit final XGBoost on all training data
+#############################
+
+final_xgb_fit <- final_xgb_wf %>%
+  fit(data = kobe_train_fe)
+
+
+#############################
+## Generate predictions for test set
+#############################
+
+# XGBoost predictions
+xgb_probs <- predict(
+  final_xgb_fit,
+  new_data = kobe_test_fe,
+  type     = "prob"
+)
+
+
+#############################
+## Build submissions (V4 names)
+#############################
+
+# XGB-only submission
+submission_xgb <- kobe_test_fe %>%
+  select(shot_id) %>%
+  bind_cols(xgb_probs) %>%
+  transmute(
+    shot_id,
+    shot_made_flag = .pred_1
+  )
+
+write_csv(submission_xgb, "kobe_xgb_submission_v4.csv")
+
+
+
+
+kobe_train_fe %>%
+  ggplot(aes(distance_hyp, as.numeric(as.character(shot_made_flag)))) +
+  stat_smooth(method = "loess") +
+  labs(y = "Shot make rate", x = "Distance from basket")
+
+
