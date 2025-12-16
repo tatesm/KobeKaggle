@@ -10,7 +10,6 @@ library(bonsai)
 library(tidymodels)
 tidymodels_prefer()
 
-set.seed(123)
 
 #############################
 ## Read data
@@ -109,10 +108,10 @@ fe_engineer <- function(df) {
       ),
       
       # ---- Season & shot type -------------------------------------------
+      game_date  = mdy(game_date),
       game_year  = year(game_date),
       game_month = month(game_date),
       game_dow   = wday(game_date, label = TRUE),
-      
       
       season_start = as.integer(str_sub(season, 1, 4)),
       season_index = season_start - min(season_start, na.rm = TRUE),
@@ -250,7 +249,6 @@ xgb_params <- parameters(
     learn_rate  = learn_rate(c(-3, -1.5))
   )
 
-set.seed(123)
 xgb_grid <- grid_latin_hypercube(
   xgb_params,
   size = 40
@@ -260,7 +258,6 @@ xgb_grid <- grid_latin_hypercube(
 ## XGBoost tuning
 #############################
 
-set.seed(123)
 xgb_res <- tune_grid(
   xgb_wf,
   resamples = folds,
